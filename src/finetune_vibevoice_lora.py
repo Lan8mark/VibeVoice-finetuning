@@ -14,10 +14,17 @@ from transformers import (
     Trainer,
     set_seed,
     TrainerCallback,
+    BitsAndBytesConfig,
 )
 from transformers import TrainingArguments as HfTrainingArguments
 
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    TaskType,
+    PeftModel,
+    prepare_model_for_kbit_training,
+)
 
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
@@ -117,8 +124,24 @@ class ModelArguments:
     train_diffusion_head: bool = field(default=False, metadata={"help": "Train diffusion prediction head (full fine-tune)"})
     train_connectors: bool = field(default=False, metadata={"help": "Train acoustic/semantic connectors (full fine-tune)"})
     layers_to_freeze: Optional[str] = field(
-        default=None, 
+        default=None,
         metadata={"help": "Comma-separated indices of diffusion head layers to freeze (e.g., '0,1,5,7,8')."}
+    )
+    load_in_4bit: bool = field(
+        default=False,
+        metadata={"help": "Enable 4-bit quantization (QLoRA) when loading the base language model."},
+    )
+    bnb_4bit_quant_type: str = field(
+        default="nf4",
+        metadata={"help": "Quantization type to use with bitsandbytes 4-bit weights (e.g., 'nf4' or 'fp4')."},
+    )
+    bnb_4bit_use_double_quant: bool = field(
+        default=True,
+        metadata={"help": "Whether to use nested double quantization for bitsandbytes 4-bit weights."},
+    )
+    bnb_4bit_compute_dtype: Optional[str] = field(
+        default=None,
+        metadata={"help": "Override compute dtype for 4-bit quantized weights (e.g., 'bfloat16', 'float16')."},
     )
 
 @dataclass
@@ -188,6 +211,36 @@ def mask_for_ce(labels: torch.Tensor, attention_mask: torch.Tensor, acoustic_inp
     out = shifted.clone()
     out[~final_mask] = pad_id
     return out
+
+
+def _resolve_torch_dtype(dtype_value: Optional[Any], fallback: torch.dtype) -> torch.dtype:
+    if dtype_value is None:
+        return fallback
+    if isinstance(dtype_value, torch.dtype):
+        return dtype_value
+    if isinstance(dtype_value, str):
+        key = dtype_value.strip().lower()
+        alias_map = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float64": torch.float64,
+            "fp64": torch.float64,
+        }
+        if key in alias_map:
+            return alias_map[key]
+        try:
+            candidate = getattr(torch, key)
+            if isinstance(candidate, torch.dtype):
+                return candidate
+        except AttributeError:
+            pass
+    logger.warning(f"Could not interpret dtype '{dtype_value}'. Falling back to {fallback}.")
+    return fallback
 
 def _patch_acoustic_encode_for_legacy_indexing(model_obj, logger_):
     try:
@@ -260,15 +313,52 @@ def main() -> None:
     # Load model
     if model_args.model_name_or_path is None:
         raise ValueError("--model_name_or_path is required to load VibeVoice base model")
-    dtype = torch.float32
+    base_dtype = torch.float32
     if training_args.bf16:
-        dtype = torch.bfloat16
+        base_dtype = torch.bfloat16
     elif getattr(training_args, "fp16", False):
-        dtype = torch.float16
+        base_dtype = torch.float16
+
+    load_in_4bit = getattr(model_args, "load_in_4bit", False)
+    model_kwargs: Dict[str, Any] = {}
+    if load_in_4bit:
+        bnb_compute_dtype = _resolve_torch_dtype(getattr(model_args, "bnb_4bit_compute_dtype", None), base_dtype)
+        try:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=getattr(model_args, "bnb_4bit_quant_type", "nf4"),
+                bnb_4bit_use_double_quant=getattr(model_args, "bnb_4bit_use_double_quant", True),
+                bnb_4bit_compute_dtype=bnb_compute_dtype,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to configure 4-bit quantization: {e}")
+        model_kwargs.update(
+            {
+                "quantization_config": quantization_config,
+                "device_map": "auto",
+                "torch_dtype": bnb_compute_dtype,
+            }
+        )
+        logger.info(
+            "Loading model in 4-bit with BitsAndBytesConfig: quant_type=%s, use_double_quant=%s, compute_dtype=%s",
+            getattr(model_args, "bnb_4bit_quant_type", "nf4"),
+            getattr(model_args, "bnb_4bit_use_double_quant", True),
+            bnb_compute_dtype,
+        )
+    else:
+        model_kwargs["torch_dtype"] = base_dtype
+
     model = VibeVoiceForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
-        torch_dtype=dtype,
+        **model_kwargs,
     )
+    if load_in_4bit:
+        try:
+            prepared_lm = prepare_model_for_kbit_training(model.model.language_model)
+            if prepared_lm is not None:
+                model.model.language_model = prepared_lm
+        except Exception as e:
+            logger.warning(f"prepare_model_for_kbit_training failed: {e}")
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
 
@@ -378,7 +468,10 @@ def main() -> None:
     tm_lower = [s.strip().lower() for s in model_args.lora_target_modules.split(",") if s.strip()]
     skip_lm_lora = (len(tm_lower) == 0) or all(t in ("none", "off", "disable", "disabled") for t in tm_lower)
     if not skip_lm_lora:
-        model.model.language_model = get_peft_model(model.model.language_model, lora_cfg)
+        if isinstance(model.model.language_model, PeftModel):
+            logger.info("language_model already contains PEFT adapters; skipping additional LoRA wrapping.")
+        else:
+            model.model.language_model = get_peft_model(model.model.language_model, lora_cfg)
     else:
         logger.info("Skipping LLM LoRA wrapping (lora_target_modules indicates none).")
 
