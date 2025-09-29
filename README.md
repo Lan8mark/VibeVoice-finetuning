@@ -201,6 +201,42 @@ python -m src.finetune_vibevoice_lora \
 ```
 
 
+### Optional: 4-bit LoRA loading
+
+The training entrypoint can quantize the base language model to 4-bit weights while keeping LoRA adapters, diffusion heads, and connectors in floating point. This reduces memory requirements for experimentation.
+
+1. Install the quantization dependencies:
+
+   ```bash
+   pip install bitsandbytes accelerate
+   ```
+
+2. Launch training with the `--load_in_4bit` flag. All other arguments remain the same:
+
+   ```bash
+   python -m src.finetune_vibevoice_lora \
+     --model_name_or_path aoi-ot/VibeVoice-Large \
+     --processor_name_or_path src/vibevoice/processor \
+     --train_jsonl prompts.jsonl \
+     --text_column_name text \
+     --audio_column_name audio \
+     --output_dir output_4bit_lora \
+     --per_device_train_batch_size 4 \
+     --gradient_accumulation_steps 32 \
+     --learning_rate 2.5e-5 \
+     --num_train_epochs 1 \
+     --logging_steps 10 \
+     --save_steps 1000 \
+     --bf16 True \
+     --do_train \
+     --remove_unused_columns False \
+     --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+     --load_in_4bit
+   ```
+
+The adapters are saved under `output_4bit_lora/lora/` exactly like full-precision runs, making it simple to swap between precision modes.
+
+
 ### JSONL format:
 
   

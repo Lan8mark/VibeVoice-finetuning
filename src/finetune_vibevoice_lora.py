@@ -19,6 +19,11 @@ from transformers import TrainingArguments as HfTrainingArguments
 
 from peft import LoraConfig, get_peft_model, TaskType
 
+try:
+    from transformers import BitsAndBytesConfig
+except ImportError:  # pragma: no cover - optional dependency
+    BitsAndBytesConfig = None
+
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -117,8 +122,12 @@ class ModelArguments:
     train_diffusion_head: bool = field(default=False, metadata={"help": "Train diffusion prediction head (full fine-tune)"})
     train_connectors: bool = field(default=False, metadata={"help": "Train acoustic/semantic connectors (full fine-tune)"})
     layers_to_freeze: Optional[str] = field(
-        default=None, 
+        default=None,
         metadata={"help": "Comma-separated indices of diffusion head layers to freeze (e.g., '0,1,5,7,8')."}
+    )
+    load_in_4bit: bool = field(
+        default=False,
+        metadata={"help": "Load the base language model weights in 4-bit via bitsandbytes."},
     )
 
 @dataclass
@@ -188,6 +197,77 @@ def mask_for_ce(labels: torch.Tensor, attention_mask: torch.Tensor, acoustic_inp
     out = shifted.clone()
     out[~final_mask] = pad_id
     return out
+
+
+def _ensure_lora_params_trainable(module: nn.Module) -> None:
+    """Force LoRA adapter parameters to remain trainable even if the base module is quantized."""
+
+    if module is None:
+        return
+
+    for name, param in module.named_parameters():
+        if not isinstance(param, torch.nn.Parameter):
+            continue
+        if ("lora_" in name) or ("lora_embedding_" in name):
+            param.requires_grad = True
+
+
+def _cast_module_to_dtype(module: Optional[nn.Module], target_dtype: torch.dtype, module_name: str = "module") -> None:
+    """Ensure module parameters/buffers stay in floating precision (fp16/fp32) even under 4-bit base quantization."""
+
+    if module is None or target_dtype is None:
+        return
+
+    try:
+        module.to(dtype=target_dtype)
+        return
+    except Exception:
+        pass
+
+    try:
+        for param in module.parameters():
+            if isinstance(param, torch.nn.Parameter) and torch.is_tensor(param.data) and param.data.is_floating_point():
+                param.data = param.data.to(dtype=target_dtype)
+                if param.grad is not None and torch.is_tensor(param.grad):
+                    param.grad = param.grad.to(dtype=target_dtype)
+        for buffer in module.buffers():
+            if torch.is_tensor(buffer) and buffer.is_floating_point():
+                buffer.data = buffer.data.to(dtype=target_dtype)
+    except Exception as exc:
+        logger.warning(f"Failed to cast {module_name} to {target_dtype}: {exc}")
+
+
+def _safe_save_state_dict(module: Optional[nn.Module], directory: str, filename: str, description: str) -> None:
+    if module is None or not hasattr(module, "state_dict"):
+        return
+
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+
+    try:
+        sd = module.state_dict()
+    except Exception as err:
+        logger.warning(f"Skipping {description} state_dict save (unavailable): {err}")
+        return
+
+    try:
+        torch.save(sd, path)
+    except Exception:
+        try:
+            cpu_sd = {}
+            for key, value in sd.items():
+                if torch.is_tensor(value):
+                    tensor = value.detach()
+                    if tensor.is_floating_point():
+                        tensor = tensor.to(dtype=torch.float32)
+                    cpu_sd[key] = tensor.cpu()
+                else:
+                    cpu_sd[key] = value
+            torch.save(cpu_sd, path)
+        except Exception as inner_err:
+            logger.warning(
+                f"Skipping {description} full-state save due to incompatible tensor types: {inner_err}"
+            )
 
 def _patch_acoustic_encode_for_legacy_indexing(model_obj, logger_):
     try:
@@ -265,9 +345,18 @@ def main() -> None:
         dtype = torch.bfloat16
     elif getattr(training_args, "fp16", False):
         dtype = torch.float16
+    load_kwargs: Dict[str, Any] = {"torch_dtype": dtype}
+    if getattr(model_args, "load_in_4bit", False):
+        if BitsAndBytesConfig is None:
+            raise ImportError("bitsandbytes/transformers 4-bit support is required when --load_in_4bit is set.")
+        load_kwargs["load_in_4bit"] = True
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+        load_kwargs.setdefault("low_cpu_mem_usage", True)
+        logger.info("Loading base model with 4-bit quantization via bitsandbytes.")
+
     model = VibeVoiceForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
-        torch_dtype=dtype,
+        **load_kwargs,
     )
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
@@ -391,12 +480,7 @@ def main() -> None:
     for _, p in model.named_parameters():
         p.requires_grad = False
 
-    try:
-        for n, p in model.model.language_model.named_parameters():
-            if "lora_A" in n or "lora_B" in n:
-                p.requires_grad = True
-    except Exception:
-        logger.warning("Could not re-enable LoRA params on language_model.")
+    _ensure_lora_params_trainable(model)
 
     # Diffusion head LoRA wrapping (optional)
     if getattr(model_args, "lora_wrap_diffusion_head", False) and hasattr(model.model, "prediction_head"):
@@ -448,13 +532,15 @@ def main() -> None:
         if hasattr(model.model, "semantic_connector"):
             for p in model.model.semantic_connector.parameters():
                 p.requires_grad = True
-    else:
-        if hasattr(model.model, "acoustic_connector"):
-            for p in model.model.acoustic_connector.parameters():
-                p.requires_grad = False
-        if hasattr(model.model, "semantic_connector"):
-            for p in model.model.semantic_connector.parameters():
-                p.requires_grad = False
+
+    fp_target_dtype = torch.float16 if getattr(training_args, "fp16", False) else (
+        torch.bfloat16 if training_args.bf16 else torch.float32
+    )
+    _cast_module_to_dtype(getattr(model.model, "prediction_head", None), fp_target_dtype, "prediction_head")
+    _cast_module_to_dtype(getattr(model.model, "acoustic_connector", None), fp_target_dtype, "acoustic_connector")
+    _cast_module_to_dtype(getattr(model.model, "semantic_connector", None), fp_target_dtype, "semantic_connector")
+
+    _ensure_lora_params_trainable(model)
 
     # Freeze embedding + head
     try:
@@ -738,7 +824,7 @@ def main() -> None:
                 target_dir = output_dir or self.args.output_dir
                 lora_out = os.path.join(target_dir, "lora")
                 os.makedirs(lora_out, exist_ok=True)
-    
+
                 # --- LLM PEFT adapters (if LoRA-wrapped) ---
                 language_model = getattr(self.model.model, "language_model", None)
                 if hasattr(language_model, "save_pretrained"):
@@ -750,27 +836,22 @@ def main() -> None:
                     ph_dir = os.path.join(lora_out, "diffusion_head")
                     os.makedirs(ph_dir, exist_ok=True)
                     pred_head.save_pretrained(ph_dir)
-    
+
                 # --- ALWAYS save FULL diffusion head state_dict for fallback ---
-                if pred_head is not None and hasattr(pred_head, "state_dict"):
-                    sd = pred_head.state_dict()
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                    ph_dir = os.path.join(lora_out, "diffusion_head")
-                    os.makedirs(ph_dir, exist_ok=True)
-                    torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
-    
+                _safe_save_state_dict(pred_head, lora_out, "diffusion_head_full.bin", "diffusion head")
+                ph_dir = os.path.join(lora_out, "diffusion_head")
+                _safe_save_state_dict(pred_head, ph_dir, "diffusion_head_full.bin", "diffusion head")
+
                 # --- Connectors (plain state_dicts) ---
                 ac = getattr(self.model.model, "acoustic_connector", None)
                 if ac is not None:
                     ac_dir = os.path.join(lora_out, "acoustic_connector")
-                    os.makedirs(ac_dir, exist_ok=True)
-                    torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-    
+                    _safe_save_state_dict(ac, ac_dir, "pytorch_model.bin", "acoustic connector")
+
                 se = getattr(self.model.model, "semantic_connector", None)
                 if se is not None:
                     se_dir = os.path.join(lora_out, "semantic_connector")
-                    os.makedirs(se_dir, exist_ok=True)
-                    torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
+                    _safe_save_state_dict(se, se_dir, "pytorch_model.bin", "semantic connector")
     
             except Exception as e:
                 logger.warning(f"Failed to save LoRA assets: {e}")
@@ -814,10 +895,13 @@ def main() -> None:
             try:
                 ph = getattr(model.model, "prediction_head", None)
                 if ph is not None and hasattr(ph, "state_dict"):
-                    sd = ph.state_dict()
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                    os.makedirs(os.path.join(lora_out, "diffusion_head"), exist_ok=True)
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head", "diffusion_head_full.bin"))
+                    _safe_save_state_dict(ph, lora_out, "diffusion_head_full.bin", "diffusion head (debug)")
+                    _safe_save_state_dict(
+                        ph,
+                        os.path.join(lora_out, "diffusion_head"),
+                        "diffusion_head_full.bin",
+                        "diffusion head (debug)",
+                    )
             except Exception as e:
                 logger.warning(f"[debug_save] Failed to save FULL diffusion head: {e}")
             # connectors
@@ -825,16 +909,14 @@ def main() -> None:
                 ac_conn = getattr(model.model, "acoustic_connector", None)
                 if ac_conn is not None:
                     ac_dir = os.path.join(lora_out, "acoustic_connector")
-                    os.makedirs(ac_dir, exist_ok=True)
-                    torch.save(ac_conn.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
+                    _safe_save_state_dict(ac_conn, ac_dir, "pytorch_model.bin", "acoustic connector (debug)")
             except Exception as e_ac:
                 logger.warning(f"[debug_save] Failed to save acoustic_connector: {e_ac}")
             try:
                 se_conn = getattr(model.model, "semantic_connector", None)
                 if se_conn is not None:
                     se_dir = os.path.join(lora_out, "semantic_connector")
-                    os.makedirs(se_dir, exist_ok=True)
-                    torch.save(se_conn.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
+                    _safe_save_state_dict(se_conn, se_dir, "pytorch_model.bin", "semantic connector (debug)")
             except Exception as e_se:
                 logger.warning(f"[debug_save] Failed to save semantic_connector: {e_se}")
         except Exception as e:
@@ -867,30 +949,26 @@ def main() -> None:
         # ALWAYS: full diffusion head state_dict fallback
         try:
             if ph is not None and hasattr(ph, "state_dict"):
-                sd = ph.state_dict()
-                torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
+                _safe_save_state_dict(ph, lora_out, "diffusion_head_full.bin", "diffusion head (final)")
                 ph_dir = os.path.join(lora_out, "diffusion_head")
-                os.makedirs(ph_dir, exist_ok=True)
-                torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
+                _safe_save_state_dict(ph, ph_dir, "diffusion_head_full.bin", "diffusion head (final)")
         except Exception as e:
             logger.warning(f"Failed to save FULL diffusion head at end: {e}")
-    
+
         # Connectors (if trained)
         try:
             ac = getattr(model.model, "acoustic_connector", None)
             if ac is not None:
                 ac_dir = os.path.join(lora_out, "acoustic_connector")
-                os.makedirs(ac_dir, exist_ok=True)
-                torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
+                _safe_save_state_dict(ac, ac_dir, "pytorch_model.bin", "acoustic connector (final)")
         except Exception as e:
             logger.warning(f"Failed to save acoustic_connector: {e}")
-    
+
         try:
             se = getattr(model.model, "semantic_connector", None)
             if se is not None:
                 se_dir = os.path.join(lora_out, "semantic_connector")
-                os.makedirs(se_dir, exist_ok=True)
-                torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
+                _safe_save_state_dict(se, se_dir, "pytorch_model.bin", "semantic connector (final)")
         except Exception as e:
             logger.warning(f"Failed to save semantic_connector: {e}")
 
