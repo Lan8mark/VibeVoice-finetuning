@@ -2,6 +2,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -24,6 +25,9 @@ from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
 from data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
+
+import transformers
+from packaging import version
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +99,17 @@ class EmaCallback(TrainerCallback):
         self._swap_in_ema(model)
 
 
+class Bnb4BitComputeDtype(str, Enum):
+    FLOAT16 = "float16"
+    BFLOAT16 = "bfloat16"
+    FLOAT32 = "float32"
+
+
+class Bnb4BitQuantType(str, Enum):
+    NF4 = "nf4"
+    FP4 = "fp4"
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(
@@ -117,8 +132,30 @@ class ModelArguments:
     train_diffusion_head: bool = field(default=False, metadata={"help": "Train diffusion prediction head (full fine-tune)"})
     train_connectors: bool = field(default=False, metadata={"help": "Train acoustic/semantic connectors (full fine-tune)"})
     layers_to_freeze: Optional[str] = field(
-        default=None, 
+        default=None,
         metadata={"help": "Comma-separated indices of diffusion head layers to freeze (e.g., '0,1,5,7,8')."}
+    )
+    load_in_4bit: bool = field(
+        default=False,
+        metadata={
+            "help": "Load the base model using 4-bit quantization. Requires bitsandbytes and transformers>=4.38.0."
+        },
+    )
+    bnb_4bit_compute_dtype: Bnb4BitComputeDtype = field(
+        default=Bnb4BitComputeDtype.BFLOAT16,
+        metadata={
+            "help": "bitsandbytes compute dtype to use for 4-bit weights. Options: float16, bfloat16, float32."
+        },
+    )
+    bnb_4bit_quant_type: Bnb4BitQuantType = field(
+        default=Bnb4BitQuantType.NF4,
+        metadata={"help": "bitsandbytes quantization data type. Options: nf4, fp4."},
+    )
+    bnb_4bit_use_double_quant: bool = field(
+        default=True,
+        metadata={
+            "help": "Enable double quantization (recommended for NF4) when loading 4-bit weights with bitsandbytes."
+        },
     )
 
 @dataclass
@@ -265,9 +302,58 @@ def main() -> None:
         dtype = torch.bfloat16
     elif getattr(training_args, "fp16", False):
         dtype = torch.float16
+
+    quantization_config = None
+    if model_args.load_in_4bit:
+        try:
+            import bitsandbytes  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "bitsandbytes is required when using --load_in_4bit. Install it with `pip install bitsandbytes`."
+            ) from exc
+
+        if version.parse(transformers.__version__) < version.parse("4.38.0"):
+            raise RuntimeError(
+                "4-bit loading requires transformers>=4.38.0. "
+                f"Current version: {transformers.__version__}."
+            )
+
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise ImportError(
+                "Your transformers installation does not provide BitsAndBytesConfig. "
+                "Please upgrade transformers to >=4.38.0."
+            ) from exc
+
+        compute_dtype_map = {
+            Bnb4BitComputeDtype.FLOAT16: torch.float16,
+            Bnb4BitComputeDtype.BFLOAT16: torch.bfloat16,
+            Bnb4BitComputeDtype.FLOAT32: torch.float32,
+        }
+        compute_dtype = compute_dtype_map.get(model_args.bnb_4bit_compute_dtype)
+        if compute_dtype is None:
+            raise ValueError(
+                f"Unsupported 4-bit compute dtype: {model_args.bnb_4bit_compute_dtype}."
+            )
+
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_type=model_args.bnb_4bit_quant_type.value,
+            bnb_4bit_use_double_quant=model_args.bnb_4bit_use_double_quant,
+        )
+        dtype = compute_dtype
+
+    model_kwargs: Dict[str, Any] = {}
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+    else:
+        model_kwargs["torch_dtype"] = dtype
+
     model = VibeVoiceForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
-        torch_dtype=dtype,
+        **model_kwargs,
     )
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
